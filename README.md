@@ -2,16 +2,6 @@
 
 A compact, automated IoT solution for monitoring soil health parameters to optimize irrigation and improve crop yield.
 
-## 📋 Table of Contents
-- [Overview](#overview)
-- [Features](#features)
-- [Hardware Components](#hardware-components)
-- [Tech Stack](#tech-stack)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Contributing](#contributing)
-- [License](#license)
-
 ## 🚀 Overview
 The Soil Monitoring System is designed to provide real-time data on soil conditions. By monitoring moisture levels and other critical metrics, this system helps farmers and gardeners prevent over-watering and under-watering, ensuring optimal plant growth and water conservation.
 
