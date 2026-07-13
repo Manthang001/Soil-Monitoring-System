@@ -1,0 +1,717 @@
+/*
+ * ULTIMATE SVPUAT GATEWAY: LORA RX + MODBUS + SD + OLED + RTC + THINGSPEAK + 4G OTA
+ * Dual Calibration: v10.1 Polynomial (ID 0 & 1), v9.3 Hybrid (ID 2 & 3)
+ * OTA: GitHub version check + binary download over 4G (Modem AT Commands)
+ */
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <RadioLib.h>
+#include <FS.h>
+#include <SD.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <RTClib.h>
+#include <ModbusMaster.h>
+#include <HardwareSerial.h>
+#include <Update.h>
+
+// ================= PINS =================
+#define I2C_SDA     21
+#define I2C_SCL     22
+#define RS485_RX    16
+#define RS485_TX    17
+#define RS485_DE    4
+#define MODEM_RX    34
+#define MODEM_TX    25
+#define LORA_SCK    18
+#define LORA_MISO   19
+#define LORA_MOSI   23
+#define LORA_NSS     5
+#define LORA_RST    27
+#define LORA_DIO1   33
+#define LORA_BUSY   32
+#define SD_SCK      14
+#define SD_MISO     26
+#define SD_MOSI     13
+#define SD_CS       15
+#define LED_PIN     2
+
+// ================= CLOUD & 4G (THINGSPEAK) =================
+const char* APN = "airtelgprs.com";
+const char* TS_SERVER = "api.thingspeak.com";
+
+const String WRITE_API_KEYS[4] = {
+  "D25EUKNYWLCOB8FF",  // Station 0 (Gateway local)
+  "8XJX2V77XEI1ISW6",  // Station 1
+  "0J5NXWY8MLBLLHBE",  // Station 2
+  "1K3UE474YNHGE095"   // Station 3
+};
+
+// ================= OTA SETTINGS =================
+const String CURRENT_VERSION = "2.0.0";
+const char* VERSION_URL = "http://raw.githubusercontent.com/Saanvi-cloud-lab/esp32-ota-test/main/version.txt";
+const char* BIN_URL     = "http://github.com/Saanvi-cloud-lab/esp32-ota-test/releases/latest/download/firmware.bin";
+
+unsigned long lastOTACheck = 0;
+const unsigned long OTA_CHECK_INTERVAL = 3600000UL;      // 1 hour – OTA check interval
+
+// ================= DATA UPLOAD INTERVAL (THINGSPEAK) =================
+const unsigned long UPLOAD_INTERVAL = 3600000UL;          // 1 hour – ThingSpeak upload interval
+
+// ================= DATA STRUCTURES =================
+#define MAX_REMOTE 4
+struct StationData {
+  int id;
+  float temperature, moisture, ph, ec, nitrogen, phosphorus, potassium, rssi;
+  bool received;
+  bool error;
+};
+StationData stations[MAX_REMOTE];
+bool selfOK = false;
+
+// ================= OBJECTS =================
+SPIClass loraSPI(VSPI);
+SPIClass sdSPI(HSPI);
+Adafruit_SH1106G display(128, 64, &Wire, -1);
+RTC_DS3231 rtc;
+SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY, loraSPI);
+HardwareSerial rs485Serial(2);
+HardwareSerial modemSerial(1);
+ModbusMaster node;
+
+// ================= GLOBAL VARIABLES =================
+volatile bool rxFlag = false;
+int rxCount = 0;
+bool loraReady = false, sdReady = false, localReadSuccess = false, rtcReady = false;
+unsigned long lastLocalRead = 0;
+unsigned long lastUploadTime = 0;                         // Timestamp for ThingSpeak upload
+float calMo=0, calTp=0, calPh=0, calEC=0, calN=0, calP=0, calK=0;
+bool otaInProgress = false;                              // Flag to modify LED behaviour
+
+// ---------- v10.1 Monotonic Polynomial (ID 0 & 1) ----------
+const float V101_EC_COEFFS[5] = {
+    0.0000000000f, 0.0000000000f, 0.0000000000f, 1.8956112938f, 0.1305077653f
+};
+#define V101_EC_X_MAX 2.0f
+
+const float V101_PH_COEFFS[4] = {
+    0.0000000000f, 0.0000000000f, 0.9700867089f, 7.9147206105f
+};
+#define V101_PH_X_MAX 14.0f
+
+const float V101_MOISTURE_COEFFS[4] = {
+    -144.4769189720f, 191.7196394627f, 49.9914779906f, -0.4829440853f
+};
+#define V101_MOISTURE_X_MAX 150.0f
+
+const float V101_N_COEFFS[4] = {
+    0.0000000000f, 0.0000000000f, 889.7574029175f, 59.6369468542f
+};
+#define V101_N_X_MAX 500.0f
+
+const float V101_P_COEFFS[4] = {
+    0.0000000000f, 0.0000000000f, 60.9822390589f, 7.6020869414f
+};
+#define V101_P_X_MAX 500.0f
+
+const float V101_K_COEFFS[4] = {
+    0.0000000000f, 0.0000000000f, 356.8168895264f, 25.6981150190f
+};
+#define V101_K_X_MAX 500.0f
+
+// ---------- v9.3 Hybrid (ID 2 & 3) ----------
+// EC PCHIP
+const float V93_EC_BREAKS[16] = {
+    0.00000000f, 0.10000000f, 0.16000000f, 0.20000000f, 0.24000000f, 0.25000000f,
+    0.28000000f, 0.30000000f, 0.32000000f, 0.37000000f, 0.38000000f, 0.40000000f,
+    0.44000000f, 0.57000000f, 0.64000000f, 4.00000000f
+};
+const float V93_EC_COEFFS[4][15] = {
+    { 1.28440367f, -3977.91369351f, 12812.50000000f, -15312.50000000f, 178823.52941176f,
+      -1269.15246973f, 59938.52459016f, -70000.00000000f, 1040.00000000f, -210000.00000000f,
+       62500.00000000f, -6562.50000000f, 18.20664543f, -171.96062301f, -0.01086061f },
+    { 4.87155963f, 349.57186544f, -768.75000000f, 918.75000000f, -2738.23529412f,
+       58.66280939f, -1772.54098361f, 2100.00000000f, -78.00000000f, 3150.00000000f,
+      -1875.00000000f, 393.75000000f, -3.55029586f, 22.24132524f, -0.00857996f },
+    { 0.00000000f, 1.01284404f, 0.00000000f, 0.00000000f, 0.00000000f,
+      -1.11764706f, -1.02459016f, 0.00000000f, 0.00000000f, 0.00000000f,
+       0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f, 0.58596438f },
+    { 0.00000000f, 0.05000000f, 0.51000000f, 0.10000000f, 0.59000000f,
+       0.49500000f, 0.48000000f, 0.23000000f, 0.51000000f, 0.44500000f,
+       0.55000000f, 0.30000000f, 0.51000000f, 0.49000000f, 0.54000000f }
+};
+#define V93_EC_SEGMENTS 15
+
+// pH PCHIP
+const float V93_PH_BREAKS[9] = {
+    6.90000000f, 7.50000000f, 7.60000000f, 7.70000000f, 7.90000000f,
+    8.00000000f, 8.40000000f, 8.50000000f, 8.60000000f
+};
+const float V93_PH_COEFFS[4][8] = {
+    { -1.71296296f, -833.58490566f, -13.58490566f, 38.35880640f, 103.43522562f,
+      -8.59375000f, 12.50000000f, 0.00000000f },
+    { 3.08333333f, 130.35849057f, -3.28301887f, -14.58842795f, -9.35371179f,
+      5.93750000f, -2.50000000f, 0.00000000f },
+    { -1.85000000f, 0.00000000f, 1.06415094f, 0.00000000f, -1.23231441f,
+      0.00000000f, 0.62500000f, 0.50000000f },
+    { 8.53000000f, 8.16000000f, 8.63000000f, 8.69000000f, 8.41333333f,
+      8.30000000f, 8.70000000f, 8.75000000f }
+};
+#define V93_PH_SEGMENTS 8
+
+// Moisture B-spline (deg 3)
+const float V93_MOISTURE_KNOTS[13] = {
+    0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f, 50.20000000f,
+    54.50000000f, 56.00000000f, 58.80000000f, 62.00000000f, 150.00000000f,
+    150.00000000f, 150.00000000f, 150.00000000f
+};
+const float V93_MOISTURE_BCOEFFS[9] = {
+    -0.00030497f, 42.19630578f, 11.68780147f, 37.03795738f, 36.26621184f,
+    40.94095730f, 60.41102896f, 57.05043423f, 57.65199583f
+};
+const int V93_MOISTURE_DEGREE = 3;
+
+// N B-spline (deg 3)
+const float V93_N_KNOTS[13] = {
+    0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f, 14.00000000f,
+    19.00000000f, 38.00000000f, 38.00000000f, 41.00000000f, 500.00000000f,
+    500.00000000f, 500.00000000f, 500.00000000f
+};
+const float V93_N_BCOEFFS[9] = {
+    0.00829006f, 137.26437657f, 137.26437657f, 137.26437657f, 137.26437657f,
+    137.26437657f, 138.63272086f, 367.57826398f, 604.38377221f
+};
+const int V93_N_DEGREE = 3;
+
+// P B-spline (deg 3)
+const float V93_P_KNOTS[13] = {
+    0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f, 70.00000000f,
+    79.00000000f, 90.00000000f, 134.00000000f, 140.00000000f, 500.00000000f,
+    500.00000000f, 500.00000000f, 500.00000000f
+};
+const float V93_P_BCOEFFS[9] = {
+    -0.00029686f, 9.57545093f, 23.95943626f, 23.94174961f, 23.95088429f,
+    23.94691434f, 23.96978011f, 23.40466326f, 51.47887426f
+};
+const int V93_P_DEGREE = 3;
+
+// K B-spline (deg 3)
+const float V93_K_KNOTS[13] = {
+    0.00000000f, 0.00000000f, 0.00000000f, 0.00000000f, 72.00000000f,
+    108.00000000f, 117.00000000f, 127.00000000f, 134.00000000f, 500.00000000f,
+    500.00000000f, 500.00000000f, 500.00000000f
+};
+const float V93_K_BCOEFFS[9] = {
+    -0.00055833f, 106.49678923f, 113.46167162f, 112.57733041f, 112.91370092f,
+    121.67528969f, 119.64689509f, 202.07102298f, 333.04381851f
+};
+const int V93_K_DEGREE = 3;
+
+// ================= EVALUATOR FUNCTIONS =================
+float v101_polynomialCal(float raw, const float* coeffs, int deg, float x_max) {
+  float xn = raw / x_max;
+  float y = 0.0f;
+  for (int i = 0; i <= deg; i++) {
+    y = y * xn + coeffs[i];
+  }
+  if (y < 0.0f) y = 0.0f;
+  return y;
+}
+
+float v93_evalPCHIP(float x, const float* breaks, const float (*coeffs)[], int n_seg) {
+  if (x <= breaks[0]) {
+    float dx = x - breaks[0];
+    return coeffs[3][0] + dx * (coeffs[2][0] + dx * (coeffs[1][0] + dx * coeffs[0][0]));
+  }
+  if (x >= breaks[n_seg]) {
+    float dx = x - breaks[n_seg];
+    return coeffs[3][n_seg-1] + dx * (coeffs[2][n_seg-1] + dx * (coeffs[1][n_seg-1] + dx * coeffs[0][n_seg-1]));
+  }
+  for (int i = 0; i < n_seg; i++) {
+    if (x >= breaks[i] && x <= breaks[i+1]) {
+      float dx = x - breaks[i];
+      return coeffs[3][i] + dx * (coeffs[2][i] + dx * (coeffs[1][i] + dx * coeffs[0][i]));
+    }
+  }
+  return 0;
+}
+
+float v93_evalBSpline(float x, const float* knots, const float* coeffs, int n_coeffs, int degree) {
+  int k = degree;
+  while (k < n_coeffs && x > knots[k+1]) k++;
+  if (k >= n_coeffs) k = n_coeffs - 1;
+
+  float N[degree+1];
+  for (int i = 0; i <= degree; i++) {
+    N[i] = (x >= knots[k-i] && x < knots[k-i+1]) ? 1.0f : 0.0f;
+  }
+  for (int d = 1; d <= degree; d++) {
+    for (int i = 0; i <= degree - d; i++) {
+      int left = k - i;
+      int right = k - i + d;
+      float alpha = 0.0f, beta = 0.0f;
+      float denom1 = knots[right] - knots[left];
+      float denom2 = knots[right+1] - knots[left+1];
+      if (denom1 != 0) alpha = (x - knots[left]) / denom1;
+      if (denom2 != 0) beta  = (knots[right+1] - x) / denom2;
+      N[i] = alpha * N[i] + beta * N[i+1];
+    }
+  }
+  float val = 0.0f;
+  for (int i = 0; i <= degree; i++) {
+    int idx = k - i;
+    if (idx >= 0 && idx < n_coeffs) val += coeffs[idx] * N[i];
+  }
+  return val;
+}
+
+// ================= APPLY CALIBRATION BASED ON ID =================
+void applyCalibration(int id,
+                      float rawMo, float rawTp, float rawPh, float rawEC, float rawN, float rawP, float rawK,
+                      float &calMo, float &calTp, float &calPh, float &calEC, float &calN, float &calP, float &calK) {
+  calTp = rawTp;
+  if (rawMo < 3.0f) {
+    calMo = 0; calPh = 0; calEC = 0; calN = 0; calP = 0; calK = 0;
+    return;
+  }
+
+  if (id == 0 || id == 1) {
+    calMo = v101_polynomialCal(rawMo, V101_MOISTURE_COEFFS, 3, V101_MOISTURE_X_MAX);
+    calPh = v101_polynomialCal(rawPh, V101_PH_COEFFS, 3, V101_PH_X_MAX);
+    calEC = v101_polynomialCal(rawEC, V101_EC_COEFFS, 4, V101_EC_X_MAX);
+    calN  = v101_polynomialCal(rawN, V101_N_COEFFS, 3, V101_N_X_MAX);
+    calP  = v101_polynomialCal(rawP, V101_P_COEFFS, 3, V101_P_X_MAX);
+    calK  = v101_polynomialCal(rawK, V101_K_COEFFS, 3, V101_K_X_MAX);
+  } else if (id == 2 || id == 3) {
+    calMo = v93_evalBSpline(rawMo, V93_MOISTURE_KNOTS, V93_MOISTURE_BCOEFFS, sizeof(V93_MOISTURE_BCOEFFS)/sizeof(float), V93_MOISTURE_DEGREE);
+    calPh = v93_evalPCHIP(rawPh, V93_PH_BREAKS, (const float(*)[V93_PH_SEGMENTS])V93_PH_COEFFS, V93_PH_SEGMENTS);
+    calEC = v93_evalPCHIP(rawEC, V93_EC_BREAKS, (const float(*)[V93_EC_SEGMENTS])V93_EC_COEFFS, V93_EC_SEGMENTS);
+    calN  = v93_evalBSpline(rawN, V93_N_KNOTS, V93_N_BCOEFFS, sizeof(V93_N_BCOEFFS)/sizeof(float), V93_N_DEGREE);
+    calP  = v93_evalBSpline(rawP, V93_P_KNOTS, V93_P_BCOEFFS, sizeof(V93_P_BCOEFFS)/sizeof(float), V93_P_DEGREE);
+    calK  = v93_evalBSpline(rawK, V93_K_KNOTS, V93_K_BCOEFFS, sizeof(V93_K_BCOEFFS)/sizeof(float), V93_K_DEGREE);
+  } else {
+    calMo = 0; calPh = 0; calEC = 0; calN = 0; calP = 0; calK = 0;
+  }
+}
+
+// ================= MODEM HELPERS =================
+void sendAT(String cmd, int waitMs = 1000) {
+  modemSerial.println(cmd);
+  delay(waitMs);
+  while(modemSerial.available()) Serial.write(modemSerial.read());
+}
+
+void flushModem() {
+  while(modemSerial.available()) modemSerial.read();
+}
+
+bool waitForResponse(const char* expected, int timeoutMs = 5000) {
+  unsigned long start = millis();
+  String line = "";
+  while (millis() - start < timeoutMs) {
+    while (modemSerial.available()) {
+      char c = modemSerial.read();
+      line += c;
+      if (line.endsWith(expected)) return true;
+    }
+  }
+  return false;
+}
+
+bool readRawBytes(uint8_t *buffer, size_t length, unsigned long timeoutMs = 15000) {
+  size_t count = 0;
+  unsigned long start = millis();
+  modemSerial.setTimeout(100);
+  modemSerial.readBytesUntil('\n', buffer, 1);
+  
+  while (count < length && (millis() - start) < timeoutMs) {
+    if (modemSerial.available()) {
+      buffer[count++] = modemSerial.read();
+    }
+  }
+  if (waitForResponse("OK", 2000)) return (count == length);
+  return false;
+}
+
+// ================= OTA FUNCTIONS =================
+long httpGetFileSize(const char* url) {
+  flushModem();
+  sendAT("AT+HTTPINIT", 500);
+  sendAT(String("AT+HTTPPARA=\"URL\",\"") + url + "\"", 500);
+  sendAT("AT+HTTPACTION=0", 10000);
+  if (!waitForResponse("+HTTPACTION: 0,200", 15000)) {
+    sendAT("AT+HTTPTERM", 500);
+    return -1;
+  }
+  modemSerial.println("AT+HTTPGETSIZE");
+  if (waitForResponse("+HTTPGETSIZE: ", 5000)) {
+    String szStr = "";
+    while (modemSerial.available()) {
+      char c = modemSerial.read();
+      if (c == '\n') break;
+      szStr += c;
+    }
+    sendAT("AT+HTTPTERM", 500);
+    return szStr.toInt();
+  }
+  sendAT("AT+HTTPTERM", 500);
+  return -1;
+}
+
+bool performOTAUpdate() {
+  Serial.println("[OTA] Starting firmware download...");
+  long fileSize = httpGetFileSize(BIN_URL);
+  if (fileSize <= 0) {
+    Serial.println("[OTA] Cannot get firmware size");
+    return false;
+  }
+
+  if (!Update.begin(fileSize)) {
+    Serial.println("[OTA] Not enough space");
+    return false;
+  }
+
+  sendAT("AT+HTTPTERM", 500);
+  sendAT("AT+HTTPINIT", 500);
+  sendAT(String("AT+HTTPPARA=\"URL\",\"") + BIN_URL + "\"", 500);
+  sendAT("AT+HTTPACTION=0", 10000);
+  if (!waitForResponse("+HTTPACTION: 0,200", 15000)) {
+    Update.abort();
+    sendAT("AT+HTTPTERM", 500);
+    return false;
+  }
+
+  const size_t chunkSize = 1024;
+  uint8_t buffer[chunkSize];
+  size_t totalRead = 0;
+  int retries = 0;
+
+  while (totalRead < fileSize) {
+    size_t toRead = (fileSize - totalRead > chunkSize) ? chunkSize : fileSize - totalRead;
+    modemSerial.print("AT+HTTPREAD=");
+    modemSerial.print(totalRead);
+    modemSerial.print(",");
+    modemSerial.println(toRead);
+    
+    if (readRawBytes(buffer, toRead, 20000)) {
+      Update.write(buffer, toRead);
+      totalRead += toRead;
+      Serial.printf("[OTA] %d/%ld bytes\n", totalRead, fileSize);
+      retries = 0;
+    } else {
+      retries++;
+      if (retries > 3) {
+        Serial.println("[OTA] Too many read failures");
+        Update.abort();
+        sendAT("AT+HTTPTERM", 500);
+        return false;
+      }
+      sendAT("AT+HTTPTERM", 500);
+      sendAT("AT+HTTPINIT", 500);
+      sendAT(String("AT+HTTPPARA=\"URL\",\"") + BIN_URL + "\"", 500);
+      sendAT("AT+HTTPACTION=0", 10000);
+      waitForResponse("+HTTPACTION: 0,200", 15000);
+    }
+  }
+
+  if (Update.end(true)) {
+    sendAT("AT+HTTPTERM", 500);
+    Serial.println("[OTA] Update complete! Restarting in 3 seconds...");
+    delay(3000);
+    ESP.restart();
+  }
+  sendAT("AT+HTTPTERM", 500);
+  return false;
+}
+
+void checkForUpdate() {
+  if (otaInProgress) return;
+  otaInProgress = true;
+  digitalWrite(LED_PIN, HIGH);
+
+  Serial.println("[OTA] Checking version over 4G...");
+  
+  sendAT("AT+HTTPTERM", 500);
+  sendAT("AT+HTTPINIT", 500);
+  sendAT(String("AT+HTTPPARA=\"URL\",\"") + VERSION_URL + "\"", 500);
+  sendAT("AT+HTTPACTION=0", 10000);
+  
+  if (waitForResponse("+HTTPACTION: 0,200", 15000)) {
+    modemSerial.print("AT+HTTPREAD=0,50");
+    String versionResp = "";
+    unsigned long start = millis();
+    while (millis() - start < 5000) {
+      while (modemSerial.available()) {
+        char c = modemSerial.read();
+        if (c == '\n') continue;
+        versionResp += c;
+      }
+    }
+    int idx = versionResp.indexOf('\n');
+    if (idx != -1) versionResp = versionResp.substring(idx + 1);
+    versionResp.trim();
+    
+    Serial.println("[OTA] Current: " + CURRENT_VERSION + " | Cloud: " + versionResp);
+    if (versionResp.length() > 0 && versionResp != CURRENT_VERSION) {
+      Serial.println("[OTA] New firmware! Updating...");
+      performOTAUpdate();
+    } else {
+      Serial.println("[OTA] Up to date.");
+    }
+  } else {
+    Serial.println("[OTA] Version check failed.");
+  }
+  sendAT("AT+HTTPTERM", 500);
+  
+  otaInProgress = false;
+}
+
+// ================= RS485 HELPERS =================
+void IRAM_ATTR onReceive() { rxFlag = true; }
+void preTransmission()  { digitalWrite(RS485_DE, HIGH); }
+void postTransmission() { digitalWrite(RS485_DE, LOW); }
+
+int readRegister(uint16_t reg) {
+  if (node.readHoldingRegisters(reg, 1) == node.ku8MBSuccess) return node.getResponseBuffer(0);
+  return -1;
+}
+
+// ================= SD LOGGER =================
+void logToSD(String type, String data) {
+  if (!sdReady) return;
+  File f = SD.open("/datalog.csv", FILE_APPEND);
+  if (f) {
+    String timeStr = "0000/00/00 00:00:00";
+    if (rtcReady) {
+      DateTime now = rtc.now();
+      char buf[22];
+      sprintf(buf, "%04d/%02d/%02d %02d:%02d:%02d", now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+      timeStr = String(buf);
+    }
+    f.printf("%s,%s,%s\n", timeStr.c_str(), type.c_str(), data.c_str());
+    f.close();
+  }
+}
+
+// ================= DISPLAY =================
+void updateDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+  
+  display.setCursor(0, 0);
+  if (rtcReady) {
+    DateTime now = rtc.now();
+    display.printf("%02d:%02d SD:%d LR:%d", now.hour(), now.minute(), sdReady, loraReady);
+  } else {
+    display.printf("SD:%d LR:%d", sdReady, loraReady);
+  }
+  display.drawLine(0, 9, 127, 9, SH110X_WHITE);
+  
+  if(localReadSuccess) {
+    display.setCursor(0, 12); 
+    display.printf("GW| T:%.1fC Mo:%.0f%%", calTp, calMo);
+    display.setCursor(0, 21); 
+    display.printf("    pH:%.1f EC:%.2f", calPh, calEC);
+    display.setCursor(0, 30); 
+    display.printf("    N:%.0f P:%.0f K:%.0f", calN, calP, calK);
+  } else {
+    display.setCursor(0, 21); display.print("GW| Modbus Read Fail!");
+  }
+  
+  display.drawLine(0, 40, 127, 40, SH110X_WHITE);
+  display.setCursor(0, 44); 
+  display.print("SVPUAT NODES STATUS:");
+
+  char n1[8], n2[8], n3[8];
+  sprintf(n1, stations[1].received ? "%.0f" : "Off", stations[1].rssi);
+  sprintf(n2, stations[2].received ? "%.0f" : "Off", stations[2].rssi);
+  sprintf(n3, stations[3].received ? "%.0f" : "Off", stations[3].rssi);
+  display.setCursor(0, 54);
+  display.printf("N1:%s N2:%s N3:%s", n1, n2, n3);
+  display.display();
+}
+
+// ================= THINGSPEAK UPLOAD =================
+String buildThingSpeakURL(String apiKey, float t, float m, float ph, float ec, float n, float p, float k, float rssi) {
+  char urlBuf[280];
+  sprintf(urlBuf, "AT+HTTPPARA=\"URL\",\"http://api.thingspeak.com/update?api_key=%s&field1=%.1f&field2=%.1f&field3=%.2f&field4=%.2f&field5=%d&field6=%d&field7=%d&field8=%.0f\"",
+          apiKey.c_str(), t, m, ph, ec, (int)n, (int)p, (int)k, rssi);
+  return String(urlBuf);
+}
+
+void uploadStationToThingSpeak(int stationId, String apiKey, float t, float m, float ph, float ec, float n, float p, float k, float rssi) {
+  Serial.printf("\n[4G] Uploading SVPUAT Station %d to ThingSpeak...\n", stationId);
+  sendAT("AT+CGACT=1,1", 500);
+  sendAT("AT+NETOPEN", 500);
+  modemSerial.println("AT+HTTPTERM");
+  delay(300);
+  while(modemSerial.available()) modemSerial.read(); 
+  sendAT("AT+HTTPINIT", 500);
+  String urlCmd = buildThingSpeakURL(apiKey, t, m, ph, ec, n, p, k, rssi);
+  sendAT(urlCmd, 500);
+  sendAT("AT+HTTPACTION=0", 3000);
+  sendAT("AT+HTTPTERM", 500);
+  Serial.printf("[4G] SVPUAT Station %d Finished.\n", stationId);
+}
+
+void uploadAllData() {
+  if (otaInProgress) return;
+  if (selfOK) {
+    uploadStationToThingSpeak(0, WRITE_API_KEYS[0], calTp, calMo, calPh, calEC, calN, calP, calK, 0.0f);
+    delay(1500);
+  }
+  for (int i = 1; i < MAX_REMOTE; i++) {
+    if (stations[i].received && !stations[i].error) {
+      float cMo, cTp, cPh, cEC, cN, cP, cK;
+      applyCalibration(i,
+                       stations[i].moisture, stations[i].temperature,
+                       stations[i].ph, stations[i].ec,
+                       stations[i].nitrogen, stations[i].phosphorus,
+                       stations[i].potassium,
+                       cMo, cTp, cPh, cEC, cN, cP, cK);
+      uploadStationToThingSpeak(i, WRITE_API_KEYS[i], cTp, cMo, cPh, cEC, cN, cP, cK, stations[i].rssi);
+      stations[i].received = false;
+      delay(1500);
+    }
+  }
+}
+
+// ================= LORA HANDLING =================
+void parseLoRaData(String data, float rssi) {
+  int firstComma = data.indexOf(',');
+  if(firstComma == -1) return;
+  if(!data.startsWith("SVPUAT_")) {
+    Serial.println("[WARNING] Foreign Network Data Blocked!");
+    return;
+  }
+  data = data.substring(7);
+  int id = data.substring(0, data.indexOf(',')).toInt();
+  if (id >= 1 && id < MAX_REMOTE) {
+    StationData& s = stations[id];
+    s.id = id;
+    s.rssi = rssi;
+    s.received = true;
+    s.error = false;
+    int parsed = sscanf(data.c_str(), "%d,%f,%f,%f,%f,%f,%f,%f",
+                        &s.id, &s.temperature, &s.moisture, &s.ph, &s.ec,
+                        &s.nitrogen, &s.phosphorus, &s.potassium);
+    if(parsed < 8) s.error = true;
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  pinMode(RS485_DE, OUTPUT); digitalWrite(RS485_DE, LOW);
+  pinMode(LORA_NSS, OUTPUT); digitalWrite(LORA_NSS, HIGH);
+  pinMode(SD_CS, OUTPUT);    digitalWrite(SD_CS, HIGH);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  display.begin(0x3C, true);
+  display.clearDisplay(); display.setCursor(0,10); display.print("SVPUAT GW w/OTA"); display.display();
+
+  if (rtc.begin()) {
+    rtcReady = true;
+    if (rtc.lostPower()) rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
+  modemSerial.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  Serial.println("\nWaiting 10s for SIM...");
+  for(int i=10; i>0; i--) { Serial.print(i); Serial.print(" "); delay(1000); }
+  Serial.println();
+  sendAT("AT");
+  sendAT("AT+CSQ");
+  sendAT("AT+CREG?");
+  sendAT("AT+CGDCONT=1,\"IP\",\"" + String(APN) + "\"");
+  sendAT("AT+CGACT=1,1", 3000);
+  sendAT("AT+NETOPEN", 3000);
+
+  rs485Serial.begin(9600, SERIAL_8N1, RS485_RX, RS485_TX);
+  node.begin(1, rs485Serial);
+  node.preTransmission(preTransmission);
+  node.postTransmission(postTransmission);
+
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI);
+  if (SD.begin(SD_CS, sdSPI, 4000000)) sdReady = true;
+
+  loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI);
+  if (radio.begin(868.0, 125.0, 9, 7, 0x34, 22) == RADIOLIB_ERR_NONE) {
+    loraReady = true;
+    radio.setRxBoostedGainMode(true);
+    radio.setDio1Action(onReceive);
+    radio.startReceive();
+  }
+
+  for(int i=0; i<MAX_REMOTE; i++) { stations[i].id = i; stations[i].received = false; stations[i].rssi = 0.0f; }
+  display.clearDisplay(); display.setCursor(0,0); display.println("SVPUAT GW Ready!"); display.display();
+  
+  lastOTACheck = millis();
+  lastUploadTime = millis();
+}
+
+// ================= LOOP =================
+void loop() {
+  // Heartbeat LED
+  static unsigned long lastBeat = 0;
+  if (millis() - lastBeat > (otaInProgress ? 100 : 500)) {
+    lastBeat = millis();
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+  }
+
+  // LoRa RX
+  if (rxFlag && loraReady && !otaInProgress) {
+    rxFlag = false;
+    String rxData = "";
+    if (radio.readData(rxData) == RADIOLIB_ERR_NONE) {
+      rxCount++;
+      parseLoRaData(rxData, radio.getRSSI());
+      Serial.println("[SVPUAT RX] " + rxData + " | RSSI: " + String(radio.getRSSI()));
+      logToSD("LORA_RX", rxData + ",RSSI:" + String(radio.getRSSI()));
+      updateDisplay();
+    }
+    radio.startReceive();
+  }
+
+  // Local sensor read (every 10 seconds)
+  if (millis() - lastLocalRead >= 10000 && !otaInProgress) {
+    lastLocalRead = millis();
+    int mMo = readRegister(0x0012); int mT  = readRegister(0x0013); int mEC = readRegister(0x0015);
+    int mPH = readRegister(0x0006); int mP  = readRegister(0x001F); int mN  = readRegister(0x001E);
+    int mK  = readRegister(0x0020);
+    
+    if (mMo >= 0 && mT >= 0 && mEC >= 0 && mPH >= 0 && mP >= 0 && mN >= 0 && mK >= 0) {
+      localReadSuccess = true; selfOK = true;
+      float rawMo = mMo / 10.0f;
+      float rawTp = mT / 10.0f;
+      float rawPh = mPH / 100.0f;
+      float rawEC = mEC / 1000.0f;
+      float rawN  = (float)mN;
+      float rawP  = (float)mP;
+      float rawK  = (float)mK;
+      applyCalibration(0, rawMo, rawTp, rawPh, rawEC, rawN, rawP, rawK,
+                       calMo, calTp, calPh, calEC, calN, calP, calK);
+      logToSD("LOCAL_SENSOR", String(calTp,1)+","+String(calMo,1)+","+String(calPh,2)+","+String(calEC,3)+","+String(calN,0)+","+String(calP,0)+","+String(calK,0));
+    } else {
+      localReadSuccess = false; selfOK = false;
+    }
+    updateDisplay();
+  }
+
+  // Periodic ThingSpeak upload (use global UPLOAD_INTERVAL)
+  if (millis() - lastUploadTime >= UPLOAD_INTERVAL && !otaInProgress) {
+    lastUploadTime = millis();
+    Serial.println("\n⏰ [HOURLY UPLOAD]");
+    uploadAllData();
+  }
+
+  // OTA check (non-blocking, only when idle)
+  if (millis() - lastOTACheck >= OTA_CHECK_INTERVAL && !otaInProgress) {
+    lastOTACheck = millis();
+    checkForUpdate();
+  }
+}

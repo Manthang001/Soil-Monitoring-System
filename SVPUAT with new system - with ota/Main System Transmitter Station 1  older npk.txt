@@ -1,0 +1,319 @@
+/*
+ * ULTIMATE LORA TRANSMITTER NODE: MODBUS SENSOR + SD LOGGER + OLED + RTC + LORA TX
+ * Target: ESP32 -> SVPUAT NETWORK
+ * NETWORK ISOLATION: 868.0 MHz, Sync Word 0x34, Prefix "SVPUAT_"
+ * UPDATE: Integrated Monotonic Polynomial Calibration from SPMS v10.1
+ */
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <RadioLib.h>
+#include <FS.h>
+#include <SD.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <RTClib.h>
+#include <ModbusMaster.h>
+#include <HardwareSerial.h>
+
+// ================= STATION ID =================
+const int STATION_ID = 1;
+
+// ================= PINS =================
+#define I2C_SDA     21
+#define I2C_SCL     22
+#define RS485_RX    16
+#define RS485_TX    17
+#define RS485_DE    4
+#define LORA_SCK    18
+#define LORA_MISO   19
+#define LORA_MOSI   23
+#define LORA_NSS     5
+#define LORA_RST    27
+#define LORA_DIO1   33
+#define LORA_BUSY   32
+#define SD_SCK      14
+#define SD_MISO     26
+#define SD_MOSI     13
+#define SD_CS       15
+#define LED_PIN      2
+
+// ================= TIMING SETTINGS =================
+unsigned long lastTxTime = 0;
+const unsigned long TX_INTERVAL = 30000;
+unsigned long lastLocalRead = 0;
+
+// ================= OBJECTS =================
+SPIClass loraSPI(VSPI);
+SPIClass sdSPI(HSPI);
+Adafruit_SH1106G display(128, 64, &Wire, -1);
+RTC_DS3231 rtc;
+SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY, loraSPI);
+HardwareSerial rs485Serial(2);
+ModbusMaster node;
+
+// ================= MONOTONIC POLYNOMIAL COEFFICIENTS (Generated from SPMS v10.1) =================
+// EC (dS/m) – deg 4, X_MAX = 2.0
+const float EC_COEFFS[5] = {
+    0.0000000000f, 0.0000000000f, 0.0000000000f, 1.8956112938f, 0.1305077653f
+};
+#define EC_X_MAX 2.0f
+
+// pH – deg 3, X_MAX = 14.0
+const float PH_COEFFS[4] = {
+    0.0000000000f, 0.0000000000f, 0.9700867089f, 7.9147206105f
+};
+#define PH_X_MAX 14.0f
+
+// Moisture (%) – deg 3, X_MAX = 150.0
+const float MOISTURE_COEFFS[4] = {
+    -144.4769189720f, 191.7196394627f, 49.9914779906f, -0.4829440853f
+};
+#define MOISTURE_X_MAX 150.0f
+
+// Nitrogen (N) – deg 3, X_MAX = 500.0
+const float N_COEFFS[4] = {
+    0.0000000000f, 0.0000000000f, 889.7574029175f, 59.6369468542f
+};
+#define N_X_MAX 500.0f
+
+// Phosphorus (P) – deg 3, X_MAX = 500.0
+const float P_COEFFS[4] = {
+    0.0000000000f, 0.0000000000f, 60.9822390589f, 7.6020869414f
+};
+#define P_X_MAX 500.0f
+
+// Potassium (K) – deg 3, X_MAX = 500.0
+const float K_COEFFS[4] = {
+    0.0000000000f, 0.0000000000f, 356.8168895264f, 25.6981150190f
+};
+#define K_X_MAX 500.0f
+
+// ================= CALIBRATION FUNCTIONS =================
+float polynomialCal(float raw, const float* coeffs, int deg, float x_max) {
+  float xn = raw / x_max;
+  float y = 0.0f;
+  for (int i = 0; i <= deg; i++) {
+    y = y * xn + coeffs[i];   // Horner's method (coefficients in descending order)
+  }
+  if (y < 0.0f) y = 0.0f;
+  return y;
+}
+
+float calibrateEC(float raw) { return polynomialCal(raw, EC_COEFFS, 4, EC_X_MAX); }
+float calibratePH(float raw) { return polynomialCal(raw, PH_COEFFS, 3, PH_X_MAX); }
+float calibrateMoisture(float raw) { return polynomialCal(raw, MOISTURE_COEFFS, 3, MOISTURE_X_MAX); }
+float calibrateN(float raw) { return polynomialCal(raw, N_COEFFS, 3, N_X_MAX); }
+float calibrateP(float raw) { return polynomialCal(raw, P_COEFFS, 3, P_X_MAX); }
+float calibrateK(float raw) { return polynomialCal(raw, K_COEFFS, 3, K_X_MAX); }
+
+// ================= STATE VARIABLES =================
+bool loraReady = false, sdReady = false, localReadSuccess = false, rtcReady = false;
+float calMo=0, calTp=0, calPh=0, calEC=0, calN=0, calP=0, calK=0;
+float rawMo_tx=0, rawTp_tx=0, rawPh_tx=0, rawEC_tx=0, rawN_tx=0, rawP_tx=0, rawK_tx=0;
+int txSuccessCount = 0;
+int txFailCount = 0;
+
+// ================= RS485 HELPERS =================
+void preTransmission()  { digitalWrite(RS485_DE, HIGH); }
+void postTransmission() { digitalWrite(RS485_DE, LOW); }
+
+int readRegister(uint16_t reg) {
+  if (node.readHoldingRegisters(reg, 1) == node.ku8MBSuccess)
+    return node.getResponseBuffer(0);
+  return -1;
+}
+
+// ================= SD LOGGER =================
+void logToSD(String type, String data) {
+  if (!sdReady) return;
+  File f = SD.open("/datalog.csv", FILE_APPEND);
+  if (f) {
+    String timeStr = "0000/00/00 00:00:00";
+    if (rtcReady) {
+      DateTime now = rtc.now();
+      char buf[22];
+      sprintf(buf, "%04d/%02d/%02d %02d:%02d:%02d",
+              now.year(), now.month(), now.day(),
+              now.hour(), now.minute(), now.second());
+      timeStr = String(buf);
+    }
+    f.printf("%s,%s,%s\n", timeStr.c_str(), type.c_str(), data.c_str());
+    f.close();
+  }
+}
+
+// ================= DISPLAY =================
+void updateDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+
+  display.setCursor(0, 0);
+  if (rtcReady) {
+    DateTime now = rtc.now();
+    display.printf("%02d:%02d S-ID:%d LR:%d", now.hour(), now.minute(), STATION_ID, loraReady);
+  } else {
+    display.printf("S-ID:%d LR:%d SD:%d", STATION_ID, loraReady, sdReady);
+  }
+  display.drawLine(0, 9, 127, 9, SH110X_WHITE);
+
+  if (localReadSuccess) {
+    display.setCursor(0, 13); display.printf("T:%.1f M:%.1f%%", calTp, calMo);
+    display.setCursor(0, 23); display.printf("pH:%.2f EC:%.2f", calPh, calEC);
+    display.setCursor(0, 33); display.printf("N:%.0f P:%.0f K:%.0f", calN, calP, calK);
+  } else {
+    display.setCursor(0, 23); display.print("Sensor Read Failed!");
+  }
+  display.drawLine(0, 43, 127, 43, SH110X_WHITE);
+
+  display.setCursor(0, 47);
+  display.printf("TX OK: %d", txSuccessCount);
+  display.setCursor(0, 56);
+  display.printf("TX FAIL: %d", txFailCount);
+  display.display();
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n\n========== SVPUAT TX NODE BOOT ==========");
+
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(RS485_DE, OUTPUT); digitalWrite(RS485_DE, LOW);
+  pinMode(LORA_NSS, OUTPUT); digitalWrite(LORA_NSS, HIGH);
+  pinMode(SD_CS, OUTPUT);    digitalWrite(SD_CS, HIGH);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  display.begin(0x3C, true);
+  display.clearDisplay();
+  display.setCursor(0, 10);
+  display.print("SVPUAT TX Booting...");
+  display.display();
+
+  if (rtc.begin()) {
+    rtcReady = true;
+    if (rtc.lostPower()) rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
+  rs485Serial.begin(9600, SERIAL_8N1, RS485_RX, RS485_TX);
+  node.begin(1, rs485Serial);
+  node.preTransmission(preTransmission);
+  node.postTransmission(postTransmission);
+  Serial.println("[RS485] Ready at 9600 baud");
+
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI);
+  if (SD.begin(SD_CS, sdSPI, 4000000)) {
+    sdReady = true;
+    if (!SD.exists("/datalog.csv")) {
+      File f = SD.open("/datalog.csv", FILE_WRITE);
+      if (f) { f.println("timestamp,type,data"); f.close(); }
+    }
+  }
+
+  loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI);
+  if (radio.begin(868.0, 125.0, 9, 7, 0x34, 22) == RADIOLIB_ERR_NONE) {
+    loraReady = true;
+    Serial.println("[LORA] ✅ Ready at 868.0MHz (SVPUAT NETWORK)");
+  } else {
+    Serial.println("[LORA] ❌ Init failed!");
+  }
+
+  Serial.println("\n========== SVPUAT TX READY ==========\n");
+  updateDisplay();
+}
+
+// ================= LOOP =================
+void loop() {
+  // ── 1. Local Sensor Read (Har 10 Seconds) ─────────────────────────────
+  if (millis() - lastLocalRead >= 10000) {
+    lastLocalRead = millis();
+
+    int mMo = readRegister(0x0012); int mT  = readRegister(0x0013); int mEC = readRegister(0x0015);
+    int mPH = readRegister(0x0006);
+    int mP  = readRegister(0x001F); int mN  = readRegister(0x001E);
+    int mK  = readRegister(0x0020);
+
+    if (mMo >= 0 && mT >= 0 && mEC >= 0 && mPH >= 0 && mN >= 0 && mP >= 0 && mK >= 0) {
+      localReadSuccess = true;
+
+      float rawMo = mMo / 10.0f;
+      float rawTp = mT  / 10.0f;
+      float rawPh = mPH / 100.0f;
+      float rawEC = mEC / 1000.0f;
+      float rawN  = (float)mN;
+      float rawP  = (float)mP;
+      float rawK  = (float)mK;
+
+      // Save raw values for LoRa TX
+      rawMo_tx = rawMo;
+      rawTp_tx = rawTp;
+      rawPh_tx = rawPh;
+      rawEC_tx = rawEC;
+      rawN_tx  = rawN;
+      rawP_tx  = rawP;
+      rawK_tx  = rawK;
+
+      // ── Calibrated values using Python Polynomial Models ──
+      calTp = rawTp;                              // no calibration for temperature
+      if (rawMo < 3.0f) {
+        calMo = 0; calPh = 0; calEC = 0;
+        calN = 0; calP = 0; calK = 0;
+      } else {
+        calMo = calibrateMoisture(rawMo);
+        calPh = calibratePH(rawPh);
+        calEC = calibrateEC(rawEC);
+        calN  = calibrateN(rawN);
+        calP  = calibrateP(rawP);
+        calK  = calibrateK(rawK);
+      }
+
+      // Log calibrated data to SD
+      String sensorData = String(calTp,1) + "," + String(calMo,1) + "," +
+                          String(calPh,2) + "," + String(calEC,3) + "," +
+                          String(calN,0)  + "," + String(calP,0)  + "," + String(calK,0);
+      logToSD("SENSOR_READ", sensorData);
+
+    } else {
+      localReadSuccess = false;
+      logToSD("SENSOR_ERROR", "Modbus_fail");
+      Serial.println("❌ Sensor read failed");
+    }
+    updateDisplay();
+  }
+
+  // ── 2. LoRa Transmission (Har 30 Seconds) ─────────────────────────────
+  if (millis() - lastTxTime >= TX_INTERVAL) {
+    lastTxTime = millis();
+
+    if (loraReady && localReadSuccess) {
+      String txPayload = "SVPUAT_" + String(STATION_ID) + "," +
+                         String(rawTp_tx,1) + "," +
+                         String(rawMo_tx,1) + "," +
+                         String(rawPh_tx,2) + "," +
+                         String(rawEC_tx,3) + "," +
+                         String(rawN_tx,0)  + "," +
+                         String(rawP_tx,0)  + "," +
+                         String(rawK_tx,0);
+
+      Serial.println("\n📡 [LORA TX] Sending RAW Data: " + txPayload);
+      digitalWrite(LED_PIN, HIGH);
+      int state = radio.transmit(txPayload);
+      digitalWrite(LED_PIN, LOW);
+
+      if (state == RADIOLIB_ERR_NONE) {
+        Serial.println("[LORA] ✅ Transmission successful!");
+        txSuccessCount++;
+        logToSD("LORA_TX_OK", txPayload);
+      } else {
+        Serial.printf("[LORA] ❌ Transmission failed, code: %d\n", state);
+        txFailCount++;
+        logToSD("LORA_TX_FAIL", "Error_" + String(state));
+      }
+      updateDisplay();
+    } else if (!localReadSuccess) {
+      Serial.println("\n⚠️ [LORA TX] Skipped - Sensor Error");
+    }
+  }
+}
